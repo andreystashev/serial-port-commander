@@ -1,11 +1,15 @@
 #include "widget.h"
 #include "ui_widget.h"
+#include <QSaveFile>
 
 stmConnector::stmConnector(QWidget *parent)
     : QWidget(parent)
     , ui(new Ui::Widget)
 {
     ui->setupUi(this);
+    serialPort = new QSerialPort(this);
+    connect(serialPort, &QSerialPort::readyRead, this, &stmConnector::readData);
+    refreshPorts();
     ui->clearDirectory->hide();
     ui->deleteMyselfFile->hide();
     ui->deleteLocalFile->hide();
@@ -77,12 +81,12 @@ uint16_t CRC16(const void *p, uint len) {
     }
     uint8_t crc_hi = 0xFF;
     uint8_t crc_lo = 0xFF;
-    do
+    while (len-- > 0)
     {
         uint8_t i = crc_hi ^ *ptr++;
         crc_hi = crc_lo ^ (uint8_t) (auchCRCHi[i]);
         crc_lo = (uint8_t) (auchCRCLo[i]);
-    } while (--len);
+    }
 
     return ((crc_hi << 8) | crc_lo);
 }
@@ -113,89 +117,85 @@ QByteArray templateMessage(uint8_t start=0x3A,uint16_t address = 0x0020,uint8_t 
 
 
 
-static const char blankString[] = QT_TRANSLATE_NOOP("SettingsDialog", "N/A");
+void stmConnector::refreshPorts()
+{
+    const QString selectedPort = ui->serialPortInfoListBox->currentText();
+    ui->serialPortInfoListBox->clear();
+    for (const QSerialPortInfo &info : QSerialPortInfo::availablePorts()) {
+        ui->serialPortInfoListBox->addItem(info.portName());
+    }
+    const int selectedIndex = ui->serialPortInfoListBox->findText(selectedPort);
+    if (selectedIndex >= 0)
+        ui->serialPortInfoListBox->setCurrentIndex(selectedIndex);
+}
 
 void stmConnector::start()
 {
-
-    QList<QSerialPortInfo> ports = QSerialPortInfo::availablePorts();
-
-    serialPort=new QSerialPort(ports.first());
-    connect(serialPort, &QSerialPort::readyRead, this, &stmConnector::readData);
-    // Если доступных портов нет, выходим из программы
-    if (ports.isEmpty()) {
+    refreshPorts();
+    serialPort->close();
+    if (ui->serialPortInfoListBox->count() == 0) {
         ui->console->setText("No available ports");
+        return;
     }
 
-
-    else{
-    const QStringList list = ui->serialPortInfoListBox->itemData(1).toStringList();
-    ui->descriptionLabel->setText(tr("Подпись: %1").arg(list.count() > 1 ? list.at(1) : tr(blankString)));
-    ui->manufacturerLabel->setText(tr("Производитель: %1").arg(list.count() > 2 ? list.at(2) : tr(blankString)));
-    ui->serialNumberLabel->setText(tr("Серийный номер: %1").arg(list.count() > 3 ? list.at(3) : tr(blankString)));
-    ui->locationLabel->setText(tr("Местонахождение: %1").arg(list.count() > 4 ? list.at(4) : tr(blankString)));
-    ui->vidLabel->setText(tr("Идентификатор производителя: %1").arg(list.count() > 5 ? list.at(5) : tr(blankString)));
-    ui->pidLabel->setText(tr("Идентификатор продукта: %1").arg(list.count() > 6 ? list.at(6) : tr(blankString)));
-
-
-    ui->serialPortInfoListBox->clear();
-    QString description;
-    QString manufacturer;
-    QString serialNumber;
-    const auto infos = QSerialPortInfo::availablePorts();
-    for (const QSerialPortInfo &info : infos) {
-        QStringList list;
-        description = info.description();
-        manufacturer = info.manufacturer();
-        serialNumber = info.serialNumber();
-        list << info.portName()
-             << (!description.isEmpty() ? description : blankString)
-             << (!manufacturer.isEmpty() ? manufacturer : blankString)
-             << (!serialNumber.isEmpty() ? serialNumber : blankString)
-             << info.systemLocation()
-             << (info.vendorIdentifier() ? QString::number(info.vendorIdentifier(), 16) : blankString)
-             << (info.productIdentifier() ? QString::number(info.productIdentifier(), 16) : blankString);
-
-        ui->serialPortInfoListBox->addItem(list.first(), list);
-    }
-    ui->serialPortInfoListBox->addItem(tr("Custom"));
+    bool validBaudRate = false;
+    const int baudRate = ui->bodEdit->text().toInt(&validBaudRate);
+    if (!validBaudRate || baudRate <= 0) {
+        ui->console->setText("Enter a positive baud rate");
+        return;
     }
 
+    const QSerialPortInfo info(ui->serialPortInfoListBox->currentText());
+    ui->descriptionLabel->setText(tr("Description: %1").arg(info.description()));
+    ui->manufacturerLabel->setText(tr("Manufacturer: %1").arg(info.manufacturer()));
+    ui->serialNumberLabel->setText(tr("Serial number: %1").arg(info.serialNumber()));
+    ui->locationLabel->setText(tr("Location: %1").arg(info.systemLocation()));
+    ui->vidLabel->setText(tr("Vendor ID: %1").arg(info.vendorIdentifier(), 0, 16));
+    ui->pidLabel->setText(tr("Product ID: %1").arg(info.productIdentifier(), 0, 16));
 
-
-    // Настраиваем параметры соединения
-    serialPort->setBaudRate(QSerialPort::BaudRate(ui->bodEdit->text().toInt()));//460800 //921600
-    serialPort->setDataBits(QSerialPort::Data8);
-    serialPort->setParity(QSerialPort::NoParity);
-    serialPort->setStopBits(QSerialPort::OneStop);
-
-    // Открываем порт
+    serialPort->setPort(info);
+    if (!serialPort->setBaudRate(baudRate)
+        || !serialPort->setDataBits(QSerialPort::Data8)
+        || !serialPort->setParity(QSerialPort::NoParity)
+        || !serialPort->setStopBits(QSerialPort::OneStop)) {
+        ui->console->setText("Invalid serial port settings: " + serialPort->errorString());
+        return;
+    }
     if (!serialPort->open(QIODevice::ReadWrite)) {
-        ui->console->setText("Failed to open port");
+        ui->console->setText("Failed to open port: " + serialPort->errorString());
+        return;
     }
-    else{
-        ui->console->setText("Serial port open");
-    }
+    receiveData.clear();
+    receiveContainer.clear();
+    ui->console->setText("Serial port open");
 }
 
-
+void stmConnector::sendMessage(const QByteArray &message)
+{
+    if (!serialPort->isOpen()) {
+        ui->console->append("Connect to a serial port first");
+        return;
+    }
+    if (serialPort->write(message) != message.size()) {
+        ui->console->append("Failed to queue command: " + serialPort->errorString());
+        return;
+    }
+    ui->console->append("Sent: " + message.toHex());
+}
 
 void stmConnector::on_checkStatusButton_clicked()
 {
-    ui->console->append("Отправлено: "+templateMessage(0x3A,0x0020,0x06).toHex()+"\n");
-    serialPort->write(templateMessage(0x3A,0x0020,0x06));
+    sendMessage(templateMessage(0x3A,0x0020,0x06));
 }
 
 void stmConnector::on_checkFileButton_clicked()
 {
-    ui->console->append("Отправлено: "+templateMessage(0x3A,0x0020,0x05).toHex()+"\n");
-    serialPort->write(templateMessage(0x3A,0x0020,0x05));
+    sendMessage(templateMessage(0x3A,0x0020,0x05));
 }
 
 void stmConnector::on_showDirectory_clicked()
 {
-    ui->console->append("Отправлено: "+templateMessage(0x3A,0x0020,0x11).toHex()+"\n");
-    serialPort->write(templateMessage(0x3A,0x0020,0x11));
+    sendMessage(templateMessage(0x3A,0x0020,0x11));
 
 }
 
@@ -204,8 +204,7 @@ void stmConnector::on_readFileButton_clicked()
 {
     receiveData.clear();
     receiveContainer.clear();
-    ui->console->append("Отправлено: "+templateMessage(0x3A,0x0020,0x12).toHex()+"\n");
-    serialPort->write(templateMessage(0x3A,0x0020,0x12));
+    sendMessage(templateMessage(0x3A,0x0020,0x12));
 }
 
 
@@ -232,20 +231,31 @@ void stmConnector::on_clearConsole_clicked()
 
 void stmConnector::on_writeFile_clicked()
 {
-    QFile outputFile(ui->lineEdit->text()+".bin");
-    if (!outputFile.open(QIODevice::WriteOnly))
-    {
-        ui->console->setText("Failed to open output file");
+    if (receiveContainer.isEmpty()) {
+        ui->console->setText("No received data to save");
+        return;
     }
-    QString header = "fsize: "+QString::number(receiveContainer.size());
-    ui->console->setText("Header was deleted. Size: "+QString::number(header.size()));
-    qDebug()<<"Header was deleted. Size: "+QString::number(header.size());
-    if(receiveContainer.data()[0]!=0x3A)
-    receiveContainer.remove(0,header.size()+2);
-    outputFile.write(receiveContainer);
-    outputFile.close();
-    ui->console->setText("File was created. Size: "+QString::number(receiveContainer.size()));
-    qDebug()<<"File was created. Size: "+QString::number(receiveContainer.size());
+    QByteArray payload = receiveContainer;
+    if (payload.startsWith("fsize: ")) {
+        const int headerEnd = payload.indexOf("\r\n");
+        bool validSize = false;
+        const qlonglong expectedSize = headerEnd < 0 ? -1
+            : payload.mid(7, headerEnd - 7).toLongLong(&validSize);
+        if (!validSize || expectedSize < 0
+            || payload.size() - headerEnd - 2 != expectedSize) {
+            ui->console->setText("Incomplete or invalid file response");
+            return;
+        }
+        payload.remove(0, headerEnd + 2);
+    }
+    QSaveFile outputFile(ui->lineEdit->text() + ".bin");
+    if (!outputFile.open(QIODevice::WriteOnly)
+        || outputFile.write(payload) != payload.size()
+        || !outputFile.commit()) {
+        ui->console->setText("Failed to save output file: " + outputFile.errorString());
+        return;
+    }
+    ui->console->setText("File saved. Size: " + QString::number(payload.size()));
 }
 
 
@@ -256,6 +266,7 @@ void stmConnector::on_readLocalFile_clicked()
     QFile file(ui->lineEdit->text()+".bin");
     if (!file.open(QIODevice::ReadOnly)) {
         ui->console->setText("Failed to open local file");
+        return;
     }
 
     inputArray = file.readAll();
@@ -286,31 +297,27 @@ void stmConnector::on_deleteLocalFile_clicked()
 
 void stmConnector::on_clearDirectory_clicked()
 {
-    ui->console->append("Отправлено: "+templateMessage(0x3A,0x0020,0x13).toHex()+"\n");
-    serialPort->write(templateMessage(0x3A,0x0020,0x13));
+    sendMessage(templateMessage(0x3A,0x0020,0x13));
 }
 
 
 void stmConnector::on_createMyselfFile_clicked()
 {
     uint16_t fileNum =ui->lineEdit->text().toInt();
-    ui->console->append("Отправлено: "+templateMessage(0x3A,0x0020,0x14,fileNum).toHex()+"\n");
-    serialPort->write(templateMessage(0x3A,0x0020,0x14,fileNum));
+    sendMessage(templateMessage(0x3A,0x0020,0x14,fileNum));
 }
 
 
 void stmConnector::on_deleteMyselfFile_clicked()
 {
     uint16_t fileNum = ui->lineEdit->text().toInt();
-    ui->console->append("Отправлено: "+templateMessage(0x3A,0x0020,0x15,fileNum).toHex()+"\n");
-    serialPort->write(templateMessage(0x3A,0x0020,0x15,fileNum));
+    sendMessage(templateMessage(0x3A,0x0020,0x15,fileNum));
 }
 
 void stmConnector::on_defineFile_clicked()
 {
     uint16_t fileNum = ui->lineEdit->text().toInt();
-    ui->console->append("Отправлено: "+templateMessage(0x3A,0x0020,0x16,fileNum).toHex()+"\n");
-    serialPort->write(templateMessage(0x3A,0x0020,0x16,fileNum));
+    sendMessage(templateMessage(0x3A,0x0020,0x16,fileNum));
 }
 
 

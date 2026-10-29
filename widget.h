@@ -67,6 +67,9 @@ private slots:
     void on_startButton_clicked();
 
 private:
+    friend class SerialPortTest;
+    void refreshPorts();
+    void sendMessage(const QByteArray &message);
     QSerialPort *serialPort=nullptr;
     Ui::Widget *ui;
     QByteArray receiveData;
