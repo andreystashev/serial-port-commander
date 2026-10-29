@@ -42,6 +42,8 @@ This is an experimental device tool: it does not validate incoming checksums, pa
 
 ## Tests
 
+Run these commands from the repository root:
+
 ```sh
 mkdir build-tests
 cd build-tests
@@ -49,6 +51,8 @@ qmake ../tests/tests.pro
 make -j2
 QT_QPA_PLATFORM=offscreen ./serial_port_tests
 ```
+
+The [GitHub Actions workflow](.github/workflows/ci.yml) builds the application and runs these tests on Ubuntu with Qt 5 for pushes and pull requests.
 
 Tests cover disconnected commands, binary payload preservation, repeated saves, malformed/truncated responses, and empty checksum input. They do not require serial hardware. A real device is needed to validate the wire protocol end to end.
 
